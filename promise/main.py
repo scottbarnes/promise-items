@@ -1,11 +1,13 @@
 import requests
 import pickle
 import time
+import typer
+from pathlib import Path
 from datetime import datetime
 from dataclasses import dataclass, field
 from itertools import islice
-from typing import Final, Literal
-from collections.abc import Iterator, Iterable
+from typing import Final
+from collections.abc import Iterator
 
 API_URL: Final = "https://archive.org/advancedsearch.php?q=collection%3Aprotodonationitems&fl%5B%5D=identifier&sort%5B%5D=addeddate+desc&sort%5B%5D=&sort%5B%5D=&rows=1&page=1&output=json"  # noqa E501
 OL_SOLR_URL: Final = "https://openlibrary.org/search.json?fields=isbn&q=isbn:(%s)"
@@ -20,7 +22,8 @@ class Batch:
 
     NOTE: All values are based on the last run of {self.check_if_isbns_in_openlibrary()}
 
-    {promise_item_isbns}: the set of isbns in this batch.
+    {promise_item_isbns}: the set of isbns in this batch, which come from either a
+        previous run or from a query of the latest promise item.
     {hits}: the set of ISBNs from this batch known to be in Open Library.
     {misses}: the set of ISBNs from this batch known NOT to be in Open Library.
     {total}: the total number of isbns in the batch.
@@ -38,19 +41,12 @@ class Batch:
     def __post_init__(self) -> None:
         self.total = len(self.promise_item_isbns)
 
-    def check_if_isbns_in_openlibrary(
-        # self, items: Literal["promise_items", "misses"]
-        self,
-    ) -> None:
+    def check_if_isbns_in_openlibrary(self) -> None:
         """
-        Check if either {self.promise_items} or {selfmisses} are in the Open Library
-        database.
-
-        Process either {self.promise_items} or {self.misses} by turning their ISBNs
-        into a Solr query. After query Solr, use get_query_isbns() grab all the ISBNs
-        from the Solr response, and then update all the values in {batch} accordingly.
+        Process {self.promise_items} by turning their ISBNs into a Solr query. After
+        query Solr, use get_query_isbns() grab all the ISBNs from the Solr response,
+        and then update all the values in {batch} accordingly.
         """
-        # Update values based on whether we're updating {promise_items} or {misses}.
         query = " OR ".join(self.promise_item_isbns)
         query_result = requests.get(OL_SOLR_URL % query).json()
         isbns_from_query = get_query_isbns(query_result)
@@ -59,26 +55,37 @@ class Batch:
         self.in_ol_count = len(self.hits)
         self.not_in_ol_count = len(self.misses)
 
-        # # Update values based on whether we're updating {promise_items} or {misses}.
-        # match items:
-        #     case "promise_items":
-        #         query = " OR ".join(self.promise_item_isbns)
-        #         query_result = requests.get(OL_SOLR_URL % query).json()
-        #         isbns_from_query = get_query_isbns(query_result)
-        #         self.hits = self.promise_item_isbns.intersection(isbns_from_query)
-        #         self.misses = self.promise_item_isbns - isbns_from_query
-        #         self.in_ol_count = len(self.hits)
-        #         self.not_in_ol_count = len(self.misses)
-        #     case "misses":
-        #         query = " OR ".join(self.misses)
-        #         query_result = requests.get(OL_SOLR_URL % query).json()
-        #         isbns_from_query = get_query_isbns(query_result)
-        #         self.hits.update(self.promise_item_isbns.intersection(isbns_from_query))
-        #         self.misses = self.misses - isbns_from_query
-        #         self.in_ol_count = len(self.hits)
-        #         self.not_in_ol_count = len(self.misses)
 
-    def add_misses(self, delay_in_ms: int):
+@dataclass
+class BatchStats:
+    """
+    Record the stats for the batch as a whole. This is written to disk so the the
+    current and immediately-past run can be compared.
+
+    This also contains misses which can be added for using with --add-misses.
+    """
+
+    promise_item_isbns: set[str] = field(default_factory=set)
+    hits: set[str] = field(default_factory=set)
+    misses: set[str] = field(default_factory=set)
+    total: int = 0
+    in_ol_count: int = 0
+    not_in_ol_count: int = 0
+    last_run: datetime = datetime.now()
+
+    def loader(self, batches: list[Batch]) -> None:
+        """Uses the already processed {batches} to populate the values."""
+        for batch in batches:
+            self.promise_item_isbns.update(batch.promise_item_isbns)
+            self.hits.update(batch.hits)
+            self.misses.update(batch.misses)
+            self.total += batch.total
+            self.in_ol_count += batch.in_ol_count
+            self.not_in_ol_count += batch.not_in_ol_count
+
+        self.last_run = datetime.now()
+
+    def add_misses(self, delay_in_ms: int) -> None:
         """
         Attempt to add items from {self.misses} to Open Library via
         https://openlibrary.org/isbn/{isbn}. {delay_in_ms} specifies the dalay in
@@ -89,27 +96,8 @@ class Batch:
             r = requests.get(ADD_BOOK_BY_ISBN_URL % miss)
             if r.status_code == 200:
                 self.misses.remove(miss)
+            print(f"Added: {miss}")
             time.sleep(sleep_time)
-
-
-@dataclass
-class BatchStats:
-    """Record the stats for the batch as a whole. Use the misses to inform new batches."""
-
-    promise_item_isbns: set[str] = field(default_factory=set)
-    hits: set[str] = field(default_factory=set)
-    misses: set[str] = field(default_factory=set)
-    total: int = 0
-    in_ol_count: int = 0
-    not_in_ol_count: int = 0
-    last_run: datetime = datetime.now()
-
-    def loader(self, batches: Batch):
-        """Uses the already processed {batches} to populate the values."""
-        for batch in batches:
-            self.promise_item_isbns.update(batch.promise_item_isbns)
-            self.hits.update(batch.hits)
-            self.misses.update(batch.misses)
 
 
 def get_promise_item_metadata_url(API_URL: str) -> str:
@@ -168,33 +156,81 @@ def get_query_isbns(query_result: QueryType) -> set[str]:
     return isbns
 
 
-def main() -> None:
+def main(add_misses: bool = False, query_misses: bool = False) -> None:
     """
-    Get the URL for the latest promise items, acquire its ISBNs, and slice the ISBNs
-    into chunks. Then place these ISBN chunks into into individual Batch instances.
-    Then process each Batch instance and add up the total number of ISBNs that are in
-    and not in the Open Library database.
-    """
+    The entrypoint for the script.
 
+    if add_misses is True (i.e. the script was run with --add-misses):
+        This will load the data from the prior run and use them to try to add misses
+        via https://openlibrary.org/isbn/{missed_isbn}
+
+    if query_misses is True (i.e. the script was run with --query-misses):
+        This is to be run *after* --add-misses.
+
+        The only way this is different from an initial run is that it loads data from
+        the last run, prints it to the screen, and uses the ISBNs from the last run
+        so it's possible to see what using --add-misses did, if anything.
+
+    If neither --add-misses nor --query-misses is added on the command line, then:
+        Get the URL for the latest promise items, acquire its ISBNs, and slice the ISBNs
+        into chunks. Then place these ISBN chunks into into individual Batch instances.
+        Then process each Batch instance and add up the total number of ISBNs that are
+        in and not in the Open Library database. Finally, save the data to disk for
+        potential later use with --add-misses or --query-misses.
+    """
+    p = Path("./batch_stats.pickle")
     url = get_promise_item_metadata_url(API_URL)
-    isbns = get_promise_item_isbns(url)
+
+    # For --add-misses, just load the previous run data, print it, and add misses.
+    if add_misses:
+        with p.open("rb") as fp:
+            previous_batch: BatchStats = pickle.loads(fp.read())
+            # previous_batch.add_misses(1000)
+            print("Currently disabled, but here are the misses I would add")
+            print(f"{previous_batch.misses}")
+            return
+
+    # For --query-misses, just print data from the last run, load ISBNs from the last
+    # run, and continue as normal.
+    elif query_misses:
+        with p.open("rb") as fp:
+            previous_batch: BatchStats = pickle.loads(fp.read())  # type: ignore[no-redef]
+            isbns = iter(previous_batch.promise_item_isbns)
+            print(f"Stats from the last run ({previous_batch.last_run.ctime()})")
+            print(f"Total number: {previous_batch.total}")
+            print(f"Total in: {previous_batch.in_ol_count}")
+            print(f"total out: {previous_batch.not_in_ol_count}")
+            print("\n")
+
+    # If not loading ISBNs from the last run (see query_misses), then load from the
+    # web.
+    else:
+        isbns = get_promise_item_isbns(url)
+
     batches = make_batches(isbns, 100)
 
-    # Because batch.isbns holds each batch's ISBNs, this list could take a lot of
-    # memory if the promise items have a lot of ISBNs. One solution would be to
-    # clear batch.isbns after batch.process_isbns(), as they're no longer needed.
+    # Go through each batch item, check its ISBNs, update the values within the batch,
+    # and save the batch itself to processed_batches for use with BatchStats().
     processed_batches = []
     for batch in batches:
         batch.check_if_isbns_in_openlibrary()
         processed_batches.append(batch)
 
-    total = sum(batch.total for batch in processed_batches)
-    total_in = sum(batch.in_ol_count for batch in processed_batches)
-    total_out = sum(batch.not_in_ol_count for batch in processed_batches)
-    print(f"Total number: {total}")
-    print(f"Total in: {total_in}")
-    print(f"Total out: {total_out}")
+    # Load all the data from each batch object into a single BatchStats() instance
+    # which is saved for later using with --add-misses and --query-misses.
+    batch_stats = BatchStats()
+    batch_stats.loader(batches=processed_batches)
+
+    print(f"Stats for this run ({batch_stats.last_run.ctime()})")
+    print(f"Total number: {batch_stats.total}")
+    print(f"Total in: {batch_stats.in_ol_count}")
+    print(f"total out: {batch_stats.not_in_ol_count}")
+
+    # Finally, save the data from this run for possible future use.
+    with p.open(mode="wb") as fp:
+        seralized_stats = pickle.dumps(batch_stats)
+        fp.write(seralized_stats)
 
 
 if __name__ == "__main__":
-    main()
+    typer.run(main)
