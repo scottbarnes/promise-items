@@ -1,4 +1,5 @@
-from collections.abc import Iterator
+from collections.abc import Iterator, Iterable
+from isbnlib import to_isbn13
 from pathlib import Path
 from typing import TypeVar
 
@@ -114,3 +115,23 @@ def get_file_if_exists(filepath: str) -> bytes | None:
 
     with p.open(mode="rb") as fp:
         return fp.read()
+
+
+def dedup_isbns(isbns: Iterable) -> set[str]:
+    """
+    Take an iterable of ISBNs, attempt to convert them to ISBN 13s using isbnlib.
+    NOTE: this will NOT filter out 'bad' ISBNs. If isbnlib cannot convert the "ISBN"
+    to ISBN 13, that "bad" ISBN will be included in the output. This means obviously
+    bad ISBNs such as "BWB123" will remain. They can be dealt with elsewhere. This
+    only deduplicates ISBN 10 and 13 when they're the same.
+    """
+    output_isbns: set[str] = set()
+    for isbn in isbns:
+        converted_isbn = to_isbn13(str(isbn))
+        # isbnlib converts bad ISBNs to an empty string. Preserve them.
+        if converted_isbn == "":
+            output_isbns.add(str(isbn))  # isbnlib converts to int, so keep consistent.
+        else:
+            output_isbns.add(converted_isbn)
+
+    return output_isbns

@@ -13,6 +13,7 @@ from rich.progress import track
 from promise.constants import ADD_BOOK_BY_ISBN_URL, API_URL_LAST_X_ITEMS
 from promise.utils import (
     create_data_dir_if_needed,
+    dedup_isbns,
     get_file_if_exists,
     get_promise_item_urls,
     make_batches,
@@ -167,13 +168,13 @@ class Pallet:
         Populate {self.items} by reading the ISBN values from {self.url}, and
         creating promise items for each ISBN.
         """
-        ids: list[str] = requests.get(self.url).json()["extrameta"]["isbn"]
-        dedupe_ids = set(ids)
-        self.items = [
-            PromiseItem(isbn=str(item), pallet=self.name)
+        ids: list[str | int] = requests.get(self.url).json()["extrameta"]["isbn"]
+        dedupe_ids = dedup_isbns(ids)
+        self.items = sorted([
+            PromiseItem(isbn=item, pallet=self.name)
             for item in dedupe_ids
-            if not str(item).startswith("BWB")
-        ]
+            if not item.startswith("BWB")
+            ], key=lambda x: x.isbn)
 
     def write_misses(self) -> None:
         """
@@ -247,13 +248,17 @@ def add_missing(count: int = 1) -> None:
     for url in urls:
 
         name = url.split("/")[-1]
-        file = f"./data/{name}.pickle"
-        data_from_previous_run = get_file_if_exists(file)
+        file = Path(f"./data/{name}.pickle")
+        data_from_previous_run = get_file_if_exists(str(file))
 
         if data_from_previous_run:
             pallet: Pallet = pickle.loads(data_from_previous_run)
             print(f"Adding items for {name}")
             pallet.add_misses(500)
+
+            # Store state to record any attribute updates (hits, attempt_added).
+            with file.open(mode="wb") as fp:
+                fp.write(pickle.dumps(pallet))
         else:
             print(f"Can't find {file}. Try running check-latest first.")
 

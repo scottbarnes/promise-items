@@ -14,6 +14,7 @@ from promise import __version__
 from promise.constants import API_URL_LAST_X_ITEMS
 from promise.main import Pallet, PromiseItem, check_latest
 from promise.utils import (
+    dedup_isbns,
     get_file_if_exists,
     get_promise_item_urls,
     get_query_isbns,
@@ -31,16 +32,16 @@ def test_version():
     assert __version__ == "0.1.0"
 
 
-# Use a list during testing to ensure the iteration is advancing and we have stable
-# batch membership for testing.
+# Sample ISBNs as they would be extracted from ["extrameta"["isbn"]
 isbns = [
-    "9788189999520",
-    "9782880462703",
-    "9783522182676",
-    "9781405892469",
-    "9782723496117",
+    9788189999520,
+    9781405892469,
+    1405892463,
+    9782723496117,
+    "BWBM52088056",
+    9783522182676,
+    9782880462703,
 ]
-iterator_isbns = iter(isbns)
 
 
 @pytest.fixture
@@ -117,13 +118,13 @@ def test_make_batches(pallet: Pallet) -> None:
     batches = make_batches(pallet.items, 2)
     assert batches[1] == [
         PromiseItem(
-            isbn="9783522182676",
+            isbn="9782880462703",
             pallet="super_pallet_2020-09-21",
             in_openlibrary=False,
             add_attempted=False,
         ),
         PromiseItem(
-            isbn="9781405892469",
+            isbn="9783522182676",
             pallet="super_pallet_2020-09-21",
             in_openlibrary=False,
             add_attempted=False,
@@ -132,7 +133,7 @@ def test_make_batches(pallet: Pallet) -> None:
     # Ensure last iteration has remaining item(s) if <= batch size.
     assert batches[2] == [
         PromiseItem(
-            isbn="9782723496117",
+            isbn="9788189999520",
             pallet="super_pallet_2020-09-21",
             in_openlibrary=False,
             add_attempted=False,
@@ -166,7 +167,13 @@ class TestPallet:
         """Ensure a Pallet populates self.items properly on creation."""
         assert pallet.items == [
             PromiseItem(
-                isbn="9788189999520",
+                isbn="9781405892469",
+                pallet="super_pallet_2020-09-21",
+                in_openlibrary=False,
+                add_attempted=False,
+            ),
+            PromiseItem(
+                isbn="9782723496117",
                 pallet="super_pallet_2020-09-21",
                 in_openlibrary=False,
                 add_attempted=False,
@@ -184,13 +191,7 @@ class TestPallet:
                 add_attempted=False,
             ),
             PromiseItem(
-                isbn="9781405892469",
-                pallet="super_pallet_2020-09-21",
-                in_openlibrary=False,
-                add_attempted=False,
-            ),
-            PromiseItem(
-                isbn="9782723496117",
+                isbn="9788189999520",
                 pallet="super_pallet_2020-09-21",
                 in_openlibrary=False,
                 add_attempted=False,
@@ -208,7 +209,7 @@ class TestPallet:
         pallet = pallet_with_get_hits_run
         assert pallet.get_hits() == [
             PromiseItem(
-                isbn="9788189999520",
+                isbn="9781405892469",
                 pallet="super_pallet_2020-09-21",
                 in_openlibrary=True,
                 add_attempted=False,
@@ -222,7 +223,7 @@ class TestPallet:
                 original_miss=False,
             ),
             PromiseItem(
-                isbn="9781405892469",
+                isbn="9788189999520",
                 pallet="super_pallet_2020-09-21",
                 in_openlibrary=True,
                 add_attempted=False,
@@ -252,14 +253,14 @@ class TestPallet:
         assert pallet.solr_queried is True
         assert pallet.get_misses() == [
             PromiseItem(
-                isbn="9783522182676",
+                isbn="9782723496117",
                 pallet="super_pallet_2020-09-21",
                 in_openlibrary=False,
                 add_attempted=False,
                 original_miss=True,
             ),
             PromiseItem(
-                isbn="9782723496117",
+                isbn="9783522182676",
                 pallet="super_pallet_2020-09-21",
                 in_openlibrary=False,
                 add_attempted=False,
@@ -374,14 +375,14 @@ class TestPallet:
             ]
             assert second_added_misses == [
                 PromiseItem(
-                    isbn="9783522182676",
+                    isbn="9782723496117",
                     pallet="super_pallet_2020-09-21",
                     in_openlibrary=False,
                     add_attempted=True,
                     original_miss=True,
                 ),
                 PromiseItem(
-                    isbn="9782723496117",
+                    isbn="9783522182676",
                     pallet="super_pallet_2020-09-21",
                     in_openlibrary=False,
                     add_attempted=True,
@@ -396,14 +397,14 @@ class TestPallet:
         original_misses = [item for item in pallet.items if item.add_attempted is True]
         assert original_misses == [
             PromiseItem(
-                isbn="9783522182676",
+                isbn="9782723496117",
                 pallet="super_pallet_2020-09-21",
                 in_openlibrary=False,
                 add_attempted=True,
                 original_miss=True,
             ),
             PromiseItem(
-                isbn="9782723496117",
+                isbn="9783522182676",
                 pallet="super_pallet_2020-09-21",
                 in_openlibrary=False,
                 add_attempted=True,
@@ -415,8 +416,10 @@ class TestPallet:
 def test_write_misses(pallet_with_get_hits_run: Pallet):
     """Ensure write_misses() writes to disk."""
     pallet = pallet_with_get_hits_run
-    pallet.write_misses()
     p = Path("./data/super_pallet_2020-09-21_misses.tsv")
+    if p.is_file():
+        p.unlink()  # write_misses() will recreate this.
+    pallet.write_misses()
     assert "9782723496117" in p.read_text()
     p.unlink()
 
@@ -467,6 +470,21 @@ def test_get_file_if_exists_returns_none_if_file_does_not_exist():
     assert get_file_if_exists("blob") is None
 
 
+def test_dedup_isbns() -> None:
+    """
+    Ensure dedup_isbns properly detects ISBN 10s that are ISBN 13s and
+    removes the ISBN 10s.
+    """
+    assert dedup_isbns(isbns) == {
+        "9788189999520",
+        "9781405892469",
+        "9782723496117",
+        "BWBM52088056",
+        "9783522182676",
+        "9782880462703",
+    }
+
+
 ##########
 # @app.command tests.
 ##########
@@ -477,7 +495,7 @@ def test_check_latest() -> None:
     FIRST_BATCH: Final = "https://openlibrary.org/search.json?fields=isbn&q=isbn:(9788189999520%20OR%209782880462703)"  # noqa E501
     SECOND_BATCH: Final = "https://openlibrary.org/search.json?fields=isbn&q=isbn:(9783522182676%20OR%209781405892469)"  # noqa E501
     THIRD_BATCH: Final = "https://openlibrary.org/search.json?fields=isbn&q=isbn:(9782723496117)"  # noqa E501
-    ONE_BIG_BATCH: Final = "https://openlibrary.org/search.json?fields=isbn&q=isbn:(9788189999520%20OR%209782880462703%20OR%209783522182676%20OR%209781405892469%20OR%209782723496117)"  # noqa E501
+    ONE_BIG_BATCH: Final = "https://openlibrary.org/search.json?fields=isbn&q=isbn:(9781405892469%20OR%209782723496117%20OR%209782880462703%20OR%209783522182676%20OR%209788189999520)"  # noqa E501
     with requests_mock.Mocker(json_encoder=JSONEncoder) as m:
         m.get(API_URL_LAST_X_ITEMS % 1, json=response_latest_promise_item)
         m.get(
