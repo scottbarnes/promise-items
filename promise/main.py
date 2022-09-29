@@ -10,7 +10,12 @@ import typer
 
 from rich.progress import track
 
-from promise.constants import ADD_BOOK_BY_ISBN_URL, API_URL_LAST_X_ITEMS
+from promise.constants import (
+    ADD_BOOK_BY_ISBN_URL,
+    API_URL_LAST_X_ITEMS,
+    PROMISE_ITEM_URL_PREFIX,
+    OL_SOLR_URL,
+)
 from promise.utils import (
     create_data_dir_if_needed,
     dedup_isbns,
@@ -27,7 +32,7 @@ app = typer.Typer()
 class PromiseItem:
     """
     Individual promise items that belong to a pallet. Each PromiseItem represents an
-    item a donated item in a pallet.
+    a donated item in a pallet.
     """
 
     isbn: str
@@ -35,6 +40,9 @@ class PromiseItem:
     in_openlibrary: bool = False
     add_attempted: bool = False
     original_miss: bool = None  # type: ignore[assignment]
+
+    def __lt__(self, other: "PromiseItem") -> bool:
+        return self.isbn < other.isbn
 
 
 @dataclass
@@ -51,6 +59,8 @@ class Pallet:
 
     url: str
     batch_size: int
+    # self.items is created from a set. Shamefully, this was easier than rewriting
+    # tests that rely on self.items being ordered.
     items: list[PromiseItem] = field(default_factory=list)
     solr_queried: bool = False
     add_misses_run: bool = False
@@ -103,20 +113,23 @@ class Pallet:
         """
         batches = make_batches(self.items, self.batch_size)
         # Gather the batch's ISBNs and query Solr with them.
+        batch: list[PromiseItem]  # track breaks typing.
         for batch in track(batches, description="Checking hits and misses:"):
             batch_isbns = [item.isbn for item in batch]
-            solr_isbns = solr_isbn_query(batch_isbns)
+            solr_isbns = solr_isbn_query(batch_isbns, OL_SOLR_URL)
 
             # Update each batch PromiseItem with its hit/miss status.
             for item in batch:
                 if item.isbn in solr_isbns:
                     item.in_openlibrary = True
+                else:
+                    item.in_openlibrary = False
 
                 # This sets only on the first run. So long as the state is saved
                 # and read from disk, it enables comparison between original misses
                 # and misses that continue even after add attempts.
                 if item.original_miss is None:
-                    item.original_miss = False if item.isbn in solr_isbns else True
+                    item.original_miss = item.isbn not in solr_isbns
 
         if self.solr_queried is False:
             self.solr_queried = True
@@ -141,7 +154,7 @@ class Pallet:
         """Return the original miss count."""
         return len(self.get_original_misses())
 
-    def add_misses(self, delay_in_ms: int) -> None:
+    def add_misses(self, delay_in_ms: int, skip_attempted: bool) -> None:
         """
         Attempt to add missed promise items via /isbn/{isbn} with a millisecond delay
         of {delay_in_ms}.
@@ -152,12 +165,15 @@ class Pallet:
         sleep_time = delay_in_ms / 1000
 
         for miss in track(self.get_misses(), description="Adding missing items:"):
-            r = requests.get(ADD_BOOK_BY_ISBN_URL % miss.isbn)
-            if r.status_code == 200:
-                miss.in_openlibrary = True
-                print(f"miss {miss.isbn} already in library.")
+            # The default behavior is to skip adding misses for which an add
+            # has already been attempted, as many books can't be automatically
+            # imported and will be perpetuala misses.
+            if skip_attempted is True and miss.add_attempted is True:
                 continue
-            print(f"Added: {miss}")
+
+            requests.get(ADD_BOOK_BY_ISBN_URL % miss.isbn)
+
+            print(f"Add attempted: {miss}")
             miss.add_attempted = True
             time.sleep(sleep_time)
 
@@ -170,11 +186,13 @@ class Pallet:
         """
         ids: list[str | int] = requests.get(self.url).json()["extrameta"]["isbn"]
         dedupe_ids = dedup_isbns(ids)
-        self.items = sorted([
-            PromiseItem(isbn=item, pallet=self.name)
-            for item in dedupe_ids
-            if not item.startswith("BWB")
-            ], key=lambda x: x.isbn)
+        self.items = sorted(
+            [
+                PromiseItem(isbn=item, pallet=self.name)
+                for item in dedupe_ids
+                if not item.startswith("BWB")
+            ]
+        )
 
     def write_misses(self) -> None:
         """
@@ -197,17 +215,33 @@ class Pallet:
                 now = datetime.now().strftime("%Y-%m-%d_%H:%M:%S")
                 writer.writerow([now, miss.pallet, miss.isbn])
 
+    def get_item_by_isbn(self, isbn: str) -> PromiseItem | None:
+        """Get a PromiseItem from the pallet by ISBN."""
+        item = next((item for item in self.items if item.isbn == isbn), None)
+        if item is None:
+            raise KeyError(f"ISBN not in pallet: {isbn}")
+
+        return item
+
 
 @app.command()
-def check_latest(count: int = 1) -> None:
+def check(count: int = 1, direct_url: str = "") -> None:
     """
     Check hits and misses for the last {count} promise items. Also writes the
     original misses to disk as a TSV in ./data if they're not saved.
     """
     create_data_dir_if_needed()
 
-    print(f"Checking latest {count} items:\n")
-    urls = get_promise_item_urls(API_URL_LAST_X_ITEMS % count)
+    # If the user passes a URL, create a URL list of only the passed item. Otherwise
+    # parse the API output to create the relevant URLs to hit for the ISBNs.
+    if direct_url != "":
+        name = direct_url.split("/")[-1]
+        print(f"Checking promise item: {name}")
+        urls = [PROMISE_ITEM_URL_PREFIX + name]
+    else:
+        print(f"Checking latest {count} items:\n")
+        urls = get_promise_item_urls(API_URL_LAST_X_ITEMS % count)
+
     for url in urls:
         # Load data from a prior run if it exists, to preserve original_miss count.
         name = url.split("/")[-1]
@@ -231,20 +265,32 @@ def check_latest(count: int = 1) -> None:
         with file.open(mode="wb") as fp:
             fp.write(pickle.dumps(pallet))
 
-        # Write out the original misses as a TSV, if not recorded.
+        # Write out the original misses as a TSV, if not already recorded.
         miss_file = Path(f"./data/{pallet.name}_misses.tsv")
         if not miss_file.is_file():
             pallet.write_misses()
 
 
 @app.command()
-def add_missing(count: int = 1) -> None:
+def add_missing(
+    count: int = 1, direct_url: str = "", skip_attempted: bool = True
+) -> None:
     """Add misses from the last {count} promise items."""
     # If a new promise item is added between when the check is run, and this is run,
     # then the serialized data on disk won't match and this will error out because
-    # it won't find the file(s) added. In that case, check_latest will need to be
+    # it won't find the file(s) added. In that case, check will need to be
     # re-run.
-    urls = get_promise_item_urls(API_URL_LAST_X_ITEMS % count)
+
+    # If the user passes a URL, create a URL list of only the passed item. Otherwise
+    # parse the API output to create the relevant URLs to hit for the ISBNs.
+    if direct_url != "":
+        name = direct_url.split("/")[-1]
+        print(f"Checking promise item: {name}")
+        urls = [PROMISE_ITEM_URL_PREFIX + name]
+    else:
+        print(f"Checking latest {count} items:\n")
+        urls = get_promise_item_urls(API_URL_LAST_X_ITEMS % count)
+
     for url in urls:
 
         name = url.split("/")[-1]
@@ -254,13 +300,13 @@ def add_missing(count: int = 1) -> None:
         if data_from_previous_run:
             pallet: Pallet = pickle.loads(data_from_previous_run)
             print(f"Adding items for {name}")
-            pallet.add_misses(500)
+            pallet.add_misses(delay_in_ms=500, skip_attempted=skip_attempted)
 
             # Store state to record any attribute updates (hits, attempt_added).
             with file.open(mode="wb") as fp:
                 fp.write(pickle.dumps(pallet))
         else:
-            print(f"Can't find {file}. Try running check-latest first.")
+            print(f"Can't find {file}. Try running check first.")
 
 
 if __name__ == "__main__":

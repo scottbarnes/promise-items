@@ -1,11 +1,13 @@
 from collections.abc import Iterator, Iterable
+import textwrap
+from urllib.parse import parse_qs
 from isbnlib import to_isbn13
 from pathlib import Path
-from typing import TypeVar
+from typing import TypeVar, Final
 
 import requests
 
-from promise.constants import OL_SOLR_URL
+from promise.constants import PROMISE_ITEM_URL_PREFIX
 
 QueryType = dict[str, int | list[str] | str]
 T = TypeVar("T")
@@ -47,33 +49,66 @@ def get_query_isbns(query_result: QueryType) -> set[str]:
     return isbns
 
 
-def solr_isbn_query(isbns: list[str]) -> set[str]:
+def solr_isbn_query(isbns: list[str], OL_SOLR_URL: str) -> set[str]:
     """
-    Process {self.promise_items} by turning their ISBNs into a Solr query. After
-    query Solr, use get_query_isbns() grab all the ISBNs from the Solr response,
-    and then update all the values in {batch} accordingly.
+    Process ISBNS (taken from self.promise_items.isbn) by turning their ISBNs into a
+    Solr query. After querying Solr, use get_query_isbns() grab all the ISBNs from the
+    Solr response, before returning them.
+
+    The query ends up being of the form:
+    https://openlibrary.org/search.json?fields=isbn&q=isbn:(ISBN1 OR ISBN2 OR ISBN3)
 
     Returns a set of every ISBN in the Solr response.
     """
-    query = " OR ".join(isbns)
-    query_result: QueryType = requests.get(OL_SOLR_URL % query).json()
-    return get_query_isbns(query_result)
+    QUERY: Final = " OR ".join(isbns)
+    query_result = requests.get(OL_SOLR_URL % QUERY)
+    query_result_json = query_result.json()
+
+    # The limit must be greater than than numFound or we won't see the full list of
+    # matches.
+    tentative_limit = parse_qs(OL_SOLR_URL).get("limit")
+    assert isinstance(
+        tentative_limit, list
+    ), "OL_SOLR_URL must include a limit. E.g. limit=1000"
+    limit = int(tentative_limit[0])
+
+    if query_result_json.get("numFound") > limit:
+        raise ValueError(
+            textwrap.fill(
+                textwrap.dedent(
+                    """
+            'num_found' exceeds 'limit'. The 'limit' value in the API request must
+            exceed 'num_found' in the query response. Try increasing the limit
+            value in OL_SOLR_URL.
+            """
+                )
+            )
+        )
+
+    if query_result.status_code != 200:
+        raise ValueError(f"Error while querying Solr: {query_result.status_code}")
+
+    return get_query_isbns(query_result_json)
 
 
 def get_promise_item_urls(API_URL_LAST_X_ITEMS: str) -> list[str]:
     """
-    Get the last X promise item urls. E.g., if the URL was created with 5.
+    Get the last X promise item urls from the search query URL that lists
+    primise item identifiers.
+    E.g., passing the following URL, which lists the 5 most recent promise items:
+    https://archive.org/advancedsearch.php?q=collection%3Aprotodonationitems&fl[]=identifier&sort[]=addeddate+desc&sort[]=&sort[]=&rows=5&page=1&output=json  # noqa E501
+
+    would return:
     >>> ['https://archive.org/metadata/bwb_daily_pallets_2022-09-23',
          'https://archive.org/metadata/BWB-2022-09-23',
          'https://archive.org/metadata/bwb_daily_pallets_2022-09-21',
          'https://archive.org/metadata/BWB-2022-09-22',
          'https://archive.org/metadata/bwb_daily_pallets_2022-09-20']
     """
-    url_prefix = "https://archive.org/metadata/"
     promise_item_tags: list[dict[str, str]] = requests.get(API_URL_LAST_X_ITEMS).json()[
         "response"
     ]["docs"]
-    return [f"{url_prefix}" + item["identifier"] for item in promise_item_tags]
+    return [PROMISE_ITEM_URL_PREFIX + item["identifier"] for item in promise_item_tags]
 
 
 def get_promise_item_isbns(url: str) -> Iterator[str]:
@@ -117,9 +152,10 @@ def get_file_if_exists(filepath: str) -> bytes | None:
         return fp.read()
 
 
-def dedup_isbns(isbns: Iterable) -> set[str]:
+def dedup_isbns(isbns: Iterable[str | int]) -> set[str]:
     """
     Take an iterable of ISBNs, attempt to convert them to ISBN 13s using isbnlib.
+
     NOTE: this will NOT filter out 'bad' ISBNs. If isbnlib cannot convert the "ISBN"
     to ISBN 13, that "bad" ISBN will be included in the output. This means obviously
     bad ISBNs such as "BWB123" will remain. They can be dealt with elsewhere. This
@@ -130,7 +166,7 @@ def dedup_isbns(isbns: Iterable) -> set[str]:
         converted_isbn = to_isbn13(str(isbn))
         # isbnlib converts bad ISBNs to an empty string. Preserve them.
         if converted_isbn == "":
-            output_isbns.add(str(isbn))  # isbnlib converts to int, so keep consistent.
+            output_isbns.add(str(isbn))  # isbnlib converts to str, so keep consistent.
         else:
             output_isbns.add(converted_isbn)
 
