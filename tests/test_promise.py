@@ -11,14 +11,15 @@ import pytest
 import requests_mock
 
 from promise import __version__
-from promise.constants import API_URL_LAST_X_ITEMS
-from promise.main import Pallet, PromiseItem, check_latest
+from promise.constants import API_URL_LAST_X_ITEMS, OL_SOLR_URL, OL_SOLR_URL_LIMIT_1
+from promise.main import Pallet, PromiseItem, check
 from promise.utils import (
     dedup_isbns,
     get_file_if_exists,
     get_promise_item_urls,
     get_query_isbns,
     make_batches,
+    solr_isbn_query,
 )
 from tests.mock_responses import (
     response_get_promise_item_isbns,
@@ -108,54 +109,6 @@ def pallet_with_add_misses_run():
         p.add_misses(0)
 
         yield p
-
-
-def test_make_batches(pallet: Pallet) -> None:
-    """
-    Ensure make_batches() consumes the entire batch, and that the batch sizes are
-    correct.
-    """
-    batches = make_batches(pallet.items, 2)
-    assert batches[1] == [
-        PromiseItem(
-            isbn="9782880462703",
-            pallet="super_pallet_2020-09-21",
-            in_openlibrary=False,
-            add_attempted=False,
-        ),
-        PromiseItem(
-            isbn="9783522182676",
-            pallet="super_pallet_2020-09-21",
-            in_openlibrary=False,
-            add_attempted=False,
-        ),
-    ]
-    # Ensure last iteration has remaining item(s) if <= batch size.
-    assert batches[2] == [
-        PromiseItem(
-            isbn="9788189999520",
-            pallet="super_pallet_2020-09-21",
-            in_openlibrary=False,
-            add_attempted=False,
-        ),
-    ]
-    with pytest.raises(IndexError):
-        assert batches[3] == "blob"
-
-
-def test_get_query_isbns():
-    assert get_query_isbns(response_initial_query) == {
-        "0823062015",
-        "1405892463",
-        "2880460794",
-        "2880462703",
-        "8189999524",
-        "9780823062010",
-        "9781405892469",
-        "9782880460792",
-        "9782880462703",
-        "9788189999520",
-    }
 
 
 class TestPallet:
@@ -280,60 +233,6 @@ class TestPallet:
     # pallet.get_hits().
     #######
 
-    def test_add_misses_adds_miss_only_if_response_code_is_404(
-        self, pallet_with_get_hits_run: Pallet
-    ) -> None:
-        """
-        Ensure pallet.add_misses() only runs on items that are both misses AND, when
-        the add is attempted, response.status_code is 404.
-        """
-        pallet = pallet_with_get_hits_run
-        with requests_mock.Mocker() as m:
-            m.get(
-                "https://openlibrary.org/isbn/9782723496117",
-                status_code=200,
-                text="add not attempted",
-            )
-            m.get(
-                "https://openlibrary.org/isbn/9783522182676",
-                status_code=404,
-                text="add attempted",
-            )
-
-            pallet.add_misses(0)
-            added_misses = [item for item in pallet.items if item.add_attempted is True]
-            assert added_misses == [
-                PromiseItem(
-                    isbn="9783522182676",
-                    pallet="super_pallet_2020-09-21",
-                    in_openlibrary=False,
-                    add_attempted=True,
-                    original_miss=True,
-                ),
-            ]
-
-    def test_add_misses_updates_promise_item_status_for_status_code_200(
-        self, pallet_with_get_hits_run: Pallet
-    ) -> None:
-        """
-        When pallet.add_items() runs, if response.status_code == 200, then
-        the pallet item should be updated to reflect in_library = True.
-        An add should not be attempted.
-        """
-        pallet = pallet_with_get_hits_run
-        with requests_mock.Mocker() as m:
-            m.get(requests_mock.ANY, status_code=200)
-
-            pallet.add_misses(0)
-            item = next(item for item in pallet.items if item.isbn == "9783522182676")
-            assert item == PromiseItem(
-                isbn="9783522182676",
-                pallet="super_pallet_2020-09-21",
-                in_openlibrary=True,
-                add_attempted=False,
-                original_miss=True,
-            )
-
     def test_add_misses_updates_pallet_attributes(
         self, pallet_with_get_hits_run: Pallet
     ) -> None:
@@ -412,16 +311,30 @@ class TestPallet:
             ),
         ]
 
+    def test_write_misses(self, pallet_with_get_hits_run: Pallet):
+        """Ensure write_misses() writes to disk."""
+        pallet = pallet_with_get_hits_run
+        p = Path("./data/super_pallet_2020-09-21_misses.tsv")
+        if p.is_file():
+            p.unlink()  # write_misses() will recreate this.
+        pallet.write_misses()
+        assert "9782723496117" in p.read_text()
+        p.unlink()
 
-def test_write_misses(pallet_with_get_hits_run: Pallet):
-    """Ensure write_misses() writes to disk."""
-    pallet = pallet_with_get_hits_run
-    p = Path("./data/super_pallet_2020-09-21_misses.tsv")
-    if p.is_file():
-        p.unlink()  # write_misses() will recreate this.
-    pallet.write_misses()
-    assert "9782723496117" in p.read_text()
-    p.unlink()
+    def test_get_item_by_isbn(self, pallet_with_get_hits_run: Pallet):
+        """Ensure promise item look up by ISBN works as intended."""
+        pallet = pallet_with_get_hits_run
+        item = pallet.get_item_by_isbn("9783522182676")
+        if item:
+            assert item.isbn == "9783522182676"
+
+    def test_get_item_by_isbn_raises_keyerror_if_notFound(
+        self, pallet_with_get_hits_run: Pallet
+    ):
+        """It's anticipated that the ISBN will be there if looking for it."""
+        pallet = pallet_with_get_hits_run
+        with pytest.raises(KeyError):
+            item = pallet.get_item_by_isbn("1111111111")
 
 
 def test_write_misses_will_not_write_if_file_exists(pallet_with_get_hits_run: Pallet):
@@ -485,13 +398,83 @@ def test_dedup_isbns() -> None:
     }
 
 
+def test_make_batches(pallet: Pallet) -> None:
+    """
+    Ensure make_batches() consumes the entire batch, and that the batch sizes are
+    correct.
+    """
+    batches = make_batches(pallet.items, 2)
+    assert batches[1] == [
+        PromiseItem(
+            isbn="9782880462703",
+            pallet="super_pallet_2020-09-21",
+            in_openlibrary=False,
+            add_attempted=False,
+        ),
+        PromiseItem(
+            isbn="9783522182676",
+            pallet="super_pallet_2020-09-21",
+            in_openlibrary=False,
+            add_attempted=False,
+        ),
+    ]
+    # Ensure last iteration has remaining item(s) if <= batch size.
+    assert batches[2] == [
+        PromiseItem(
+            isbn="9788189999520",
+            pallet="super_pallet_2020-09-21",
+            in_openlibrary=False,
+            add_attempted=False,
+        ),
+    ]
+    with pytest.raises(IndexError):
+        assert batches[3] == "blob"
+
+
+def test_get_query_isbns():
+    assert get_query_isbns(response_initial_query) == {
+        "0823062015",
+        "1405892463",
+        "2880460794",
+        "2880462703",
+        "8189999524",
+        "9780823062010",
+        "9781405892469",
+        "9782880460792",
+        "9782880462703",
+        "9788189999520",
+    }
+
+
+def test_solr_isbn_query_raises_if_status_code_not_200():
+    with requests_mock.Mocker(json_encoder=JSONEncoder) as m, pytest.raises(ValueError):
+        QUERY_URL = "https://openlibrary.org/search.json?fields=isbn&limit=1000&q=isbn:(9788189999520)"  # noqa E501
+        m.get(QUERY_URL, json=response_initial_query, status_code=404)
+        solr_isbn_query(["9788189999520"], OL_SOLR_URL)
+
+
+def test_solr_isbn_query_raises_if_num_found_greater_than_limit():
+    """Query result has three matches, but the limit in the URL is 1."""
+    with requests_mock.Mocker(json_encoder=JSONEncoder) as m, pytest.raises(ValueError):
+        QUERY = [
+            "9788189999520",
+            "9781405892469",
+            "9782723496117",
+            "9783522182676",
+            "9782880462703",
+        ]
+        QUERY_URL = "https://openlibrary.org/search.json?fields=isbn&limit=1&q=isbn:(9788189999520%20OR%209781405892469%20OR%209782723496117%20OR%209783522182676%20OR%209782880462703)"  # noqa E501
+        m.get(QUERY_URL, json=response_initial_query)
+        solr_isbn_query(QUERY, OL_SOLR_URL_LIMIT_1)
+
+
 ##########
 # @app.command tests.
 ##########
 
 
-def test_check_latest() -> None:
-    """Verify that check_latest properly marks items as hits and misses."""
+def test_check() -> None:
+    """Verify that check properly marks items as hits and misses."""
     FIRST_BATCH: Final = "https://openlibrary.org/search.json?fields=isbn&q=isbn:(9788189999520%20OR%209782880462703)"  # noqa E501
     SECOND_BATCH: Final = "https://openlibrary.org/search.json?fields=isbn&q=isbn:(9783522182676%20OR%209781405892469)"  # noqa E501
     THIRD_BATCH: Final = "https://openlibrary.org/search.json?fields=isbn&q=isbn:(9782723496117)"  # noqa E501
@@ -507,7 +490,7 @@ def test_check_latest() -> None:
         m.get(SECOND_BATCH, json=response_initial_query)
         m.get(THIRD_BATCH, json=response_initial_query)
         m.get(ONE_BIG_BATCH, json=response_initial_query)
-        check_latest()
+        check()
 
     p = Path("./data/super_pallet_2020-09-21.pickle")
     with p.open(mode="rb") as fp:
@@ -527,4 +510,5 @@ def test_check_latest() -> None:
         )
 
     p = Path("./data/super_pallet_2020-09-21_misses.tsv")
+    assert "9782723496117" in p.read_text()
     p.unlink()
