@@ -65,6 +65,7 @@ class Pallet:
     solr_queried: bool = False
     add_misses_run: bool = False
     name: str = ""
+    bwb_sku: str = ""
     created: datetime = datetime.now()
 
     def __post_init__(self) -> None:
